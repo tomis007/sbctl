@@ -53,7 +53,7 @@ func RunCreateKeys(state *config.State) error {
 
 	if OverwriteYubikey {
 		logging.Warn("Overwriting Yubikey option enabled")
-		state.YubikeySigKeys.Overwrite = true
+		state.Yubikey.Overwrite = true
 	}
 
 	if err := sbctl.CreateDirectory(state.Fs, state.Config.Keydir); err != nil {
@@ -78,6 +78,11 @@ func RunCreateKeys(state *config.State) error {
 		if DbKeytype != "" && (DbKeytype == "file" || DbKeytype == "tpm" || DbKeytype == "yubikey") {
 			state.Config.Keys.Db.Type = DbKeytype
 		}
+	}
+
+	// if any keytype is yubikey close it appropriately at the end
+	if Keytype == "yubikey" || PKKeytype == "yubikey" || KEKKeytype == "yubikey" || DbKeytype == "yubikey" {
+		defer state.Yubikey.Close()
 	}
 
 	uuid, err := sbctl.CreateGUID(state.Fs, state.Config.GUID)
@@ -107,7 +112,7 @@ func RunCreateKeys(state *config.State) error {
 
 func createKeysCmdFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
-	f.BoolVar(&OverwriteYubikey, "--yk-overwrite", false, "overwrite existing key if it exists in the Yubikey Signature slot")
+	f.BoolVar(&OverwriteYubikey, "yk-overwrite", false, "overwrite existing key if it exists in the Yubikey Signature slot")
 	f.StringVarP(&exportPath, "export", "e", "", "export file path")
 	f.StringVarP(&databasePath, "database-path", "d", "", "location to create GUID file")
 	f.StringVarP(&Keytype, "keytype", "", "", "key type for all keys")

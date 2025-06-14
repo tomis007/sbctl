@@ -13,116 +13,88 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"os"
+	"time"
+
 	"github.com/foxboron/sbctl/config"
 	"github.com/foxboron/sbctl/hierarchy"
 	"github.com/foxboron/sbctl/logging"
-	"math/big"
-	"os"
-	"strings"
-	"time"
 
 	"github.com/go-piv/piv-go/v2/piv"
 )
 
 type YubikeyData struct {
-	Info      piv.KeyInfo `json:"Info"`
-	Slot      string      `json:"Slot"`
-	PublicKey string      `json:"PublicKey"`
+	Algorithm   piv.Algorithm   `json:"algorithm"`
+	PinPolicy   piv.PINPolicy   `json:"pinPolicy"`
+	TouchPolicy piv.TouchPolicy `json:"touchPolicy"`
+	Slot        string          `json:"slot"`
+	PublicKey   string          `json:"publicKey"`
 }
-
-var YK *piv.YubiKey
 
 type Yubikey struct {
-	keytype    BackendType
-	cert       *x509.Certificate
-	pubKeyInfo *piv.KeyInfo
+	keytype       BackendType
+	cert          *x509.Certificate
+	yubikeyReader *config.YubikeyReader
+	algorithm     piv.Algorithm
+	pinPolicy     piv.PINPolicy
+	touchPolicy   piv.TouchPolicy
 }
 
-func PIVKeyString(algorithm piv.Algorithm) string {
-	switch algorithm {
-	case piv.AlgorithmRSA2048:
-		return "RSA2048"
-	case piv.AlgorithmRSA3072:
-		return "RSA3072"
-	case piv.AlgorithmRSA4096:
-		return "RSA4096"
-	case piv.AlgorithmEC256:
-		return "EC256"
-	case piv.AlgorithmEC384:
-		return "EC384"
-	case piv.AlgorithmEd25519:
-		return "Ed25519"
-	case piv.AlgorithmX25519:
-		return "X25519"
-	default:
-		logging.Errorf("Unsupported Yubikey algorithm: %v", algorithm)
-		return ""
-	}
-}
-
-func NewYubikeyKey(conf *config.YubiConfig, hier hierarchy.Hierarchy, desc string) (*Yubikey, error) {
-	var pub crypto.PublicKey
-	if conf.PubKeyInfo != nil {
-		// Key already setup for sbctl
-		pub = conf.PubKeyInfo.PublicKey
-	} else {
-		// Find a YubiKey and open the reader.
-		if YK == nil {
-			var err error
-			YK, err = connectToYubikey()
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		keyInfo, err := YK.KeyInfo(piv.SlotSignature)
-		if errors.As(err, &piv.ErrNotFound) {
-			keyInfo.PublicKey = nil
-		} else if err != nil {
+func NewYubikeyKey(yubikeyReader *config.YubikeyReader, hier hierarchy.Hierarchy) (*Yubikey, error) {
+	cert, err := yubikeyReader.GetPIVKeyCert()
+	if err != nil {
+		if !errors.Is(err, piv.ErrNotFound) {
 			return nil, err
 		}
+	}
 
-		if keyInfo.PublicKey != nil {
-			// if there is a key and it is RSA2048 and overwrite is false, use it
-			if keyInfo.Algorithm == piv.AlgorithmRSA2048 && !conf.Overwrite {
-				logging.Println("RSA2048 Key exists in Yubikey PIV Signature Slot, using the existing key")
-				pub = keyInfo.PublicKey
-				conf.PubKeyInfo = &keyInfo
-			} else if !conf.Overwrite {
-				return nil, fmt.Errorf("yubikey key creation failed; %s key present in signature slot", PIVKeyString(keyInfo.Algorithm))
+	if cert != nil {
+		// if there is a key and it is RSA2048 and overwrite is false, use it
+		switch yubiPub := cert.PublicKey.(type) {
+		case *rsa.PublicKey:
+			// RSA2048 Public Key
+			if yubiPub.N.BitLen() == 2048 && !yubikeyReader.Overwrite {
+				logging.Println(fmt.Sprintf("RSA2048 Key MD5: %x exists in Yubikey PIV Signature Slot, using the existing key", md5sum(cert.PublicKey)))
+			} else if !yubikeyReader.Overwrite {
+				return nil, fmt.Errorf("yubikey key creation failed; %s key present in signature slot", cert.PublicKeyAlgorithm.String())
 			}
 		}
-		// if there is no key or overwrite is set, create a new one
-		if keyInfo.PublicKey == nil || conf.Overwrite {
-			if conf.Overwrite {
-				logging.Warn("Overwriting existing key %s in Signature slot", PIVKeyString(keyInfo.Algorithm))
-			}
-
-			// Generate a private key on the YubiKey.
-			key := piv.Key{
-				Algorithm:   piv.AlgorithmRSA2048,
-				PINPolicy:   piv.PINPolicyAlways,
-				TouchPolicy: piv.TouchPolicyAlways,
-			}
-			logging.Println("Creating RSA2048 key...\nPlease press Yubikey to confirm presense")
-			pub, err = YK.GenerateKey(piv.DefaultManagementKey, piv.SlotSignature, key)
-			if err != nil {
-				return nil, err
-			}
-			newKeyInfo, err := YK.KeyInfo(piv.SlotSignature)
-			if err != nil {
-				return nil, err
-			}
-			conf.PubKeyInfo = &newKeyInfo
-			logging.Println(fmt.Sprintf("Created RSA2048 key MD5: %x", md5sum(newKeyInfo.PublicKey)))
+	}
+	// if overwrite or there is no piv key create one
+	if yubikeyReader.Overwrite || cert == nil {
+		if yubikeyReader.Overwrite {
+			logging.Warn("Overwriting existing key %s in Signature slot", cert.PublicKeyAlgorithm.String())
 		}
+
+		// Generate a private key on the YubiKey.
+		key := piv.Key{
+			Algorithm:   piv.AlgorithmRSA2048,
+			PINPolicy:   piv.PINPolicyAlways,
+			TouchPolicy: piv.TouchPolicyAlways,
+		}
+		logging.Println("Creating RSA2048 key...\nPlease press Yubikey to confirm presence")
+		newKey, err := yubikeyReader.GenerateKey(piv.DefaultManagementKey, piv.SlotSignature, key)
+		if err != nil {
+			return nil, err
+		}
+		logging.Println(fmt.Sprintf("Created RSA2048 key MD5: %x", md5sum(newKey)))
+
+		// we overwrote the existing signing key, do not overwrite again if there are other
+		// key creation operations
+		yubikeyReader.Overwrite = false
+	}
+
+	ykCert, err := yubikeyReader.GetPIVKeyCert()
+	if err != nil {
+		return nil, err
 	}
 
 	auth := piv.KeyAuth{PIN: piv.DefaultPIN}
 	if pin, found := os.LookupEnv("SBCTL_YUBIKEY_PIN"); found {
 		auth = piv.KeyAuth{PIN: pin}
 	}
-	priv, err := YK.PrivateKey(piv.SlotSignature, pub, auth)
+	priv, err := yubikeyReader.PrivateKey(piv.SlotSignature, ykCert.PublicKey, auth)
 	if err != nil {
 		return nil, err
 	}
@@ -134,52 +106,44 @@ func NewYubikeyKey(conf *config.YubiConfig, hier hierarchy.Hierarchy, desc strin
 		PublicKeyAlgorithm: x509.RSA,
 		SignatureAlgorithm: x509.SHA256WithRSA,
 		NotBefore:          time.Now(),
-		NotAfter:           time.Now().AddDate(5, 0, 0),
+		NotAfter:           time.Now().AddDate(20, 0, 0),
 		Subject: pkix.Name{
-			Country:    []string{desc},
-			CommonName: desc,
+			Country:    []string{hier.Description()},
+			CommonName: hier.Description(),
 		},
 	}
 
-	logging.Println(fmt.Sprintf("Creating %s key...\nPlease press Yubikey to confirm presence for key %s MD5: %x",
+	logging.Println(fmt.Sprintf("Creating %s (%s) key...\nPlease press Yubikey to confirm presence for RSA2048 MD5: %x",
+		hier.Description(),
 		hier.String(),
-		PIVKeyString(conf.PubKeyInfo.Algorithm),
-		md5sum(conf.PubKeyInfo.PublicKey)))
-	derBytes, err := x509.CreateCertificate(rand.Reader, &c, &c, pub, priv)
+		md5sum(ykCert.PublicKey)))
+	derBytes, err := x509.CreateCertificate(rand.Reader, &c, &c, ykCert.PublicKey, priv)
 	if err != nil {
 		return nil, err
 	}
 
-	cert, err := x509.ParseCertificate(derBytes)
+	cert, err = x509.ParseCertificate(derBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	return &Yubikey{
-		keytype:    YubikeyBackend,
-		cert:       cert,
-		pubKeyInfo: conf.PubKeyInfo,
+		keytype:       YubikeyBackend,
+		cert:          cert,
+		yubikeyReader: yubikeyReader,
+		algorithm:     piv.AlgorithmRSA2048,
+		pinPolicy:     piv.PINPolicyAlways,
+		touchPolicy:   piv.TouchPolicyAlways,
 	}, nil
 }
 
-func YubikeyFromBytes(c *config.YubiConfig, keyb, pemb []byte) (*Yubikey, error) {
+func YubikeyFromBytes(yubikeyReader *config.YubikeyReader, keyb, pemb []byte) (*Yubikey, error) {
 	var yubiData YubikeyData
 	err := json.Unmarshal(keyb, &yubiData)
 	if err != nil {
 		logging.Errorf("Error unmarshalling Yubikey: %v\n", err)
 		return nil, err
 	}
-
-	pubKeyB64, err := base64.StdEncoding.DecodeString(yubiData.PublicKey)
-	if err != nil {
-		return nil, err
-	}
-	pubKey, err := x509.ParsePKCS1PublicKey(pubKeyB64)
-	if err != nil {
-		logging.Errorf("Error parsing public key: %v\n", err)
-		return nil, err
-	}
-	yubiData.Info.PublicKey = pubKey
 
 	block, _ := pem.Decode(pemb)
 	if block == nil {
@@ -191,35 +155,14 @@ func YubikeyFromBytes(c *config.YubiConfig, keyb, pemb []byte) (*Yubikey, error)
 		return nil, fmt.Errorf("failed to parse cert: %w", err)
 	}
 
-	c.PubKeyInfo = &yubiData.Info
 	return &Yubikey{
-		keytype:    YubikeyBackend,
-		cert:       cert,
-		pubKeyInfo: &yubiData.Info,
+		keytype:       YubikeyBackend,
+		cert:          cert,
+		yubikeyReader: yubikeyReader,
+		algorithm:     yubiData.Algorithm,
+		pinPolicy:     yubiData.PinPolicy,
+		touchPolicy:   yubiData.TouchPolicy,
 	}, nil
-}
-
-func connectToYubikey() (*piv.YubiKey, error) {
-	// List all smartcards connected to the system.
-	cards, err := piv.Cards()
-	if err != nil {
-		return nil, err
-	}
-
-	// Find a YubiKey and open the reader.
-	var yk *piv.YubiKey
-	for _, card := range cards {
-		if strings.Contains(strings.ToLower(card), "yubikey") {
-			if yk, err = piv.Open(card); err != nil {
-				return nil, err
-			}
-		}
-	}
-	if yk == nil {
-		return nil, fmt.Errorf("yubikey key not found")
-	}
-
-	return yk, nil
 }
 
 func (f *Yubikey) Type() BackendType              { return f.keytype }
@@ -230,42 +173,28 @@ func (f *Yubikey) Signer() crypto.Signer {
 	if pin, found := os.LookupEnv("SBCTL_YUBIKEY_PIN"); found {
 		auth = piv.KeyAuth{PIN: pin}
 	}
-	if YK == nil {
-		var err error
-		YK, err = connectToYubikey()
-		if err != nil {
-			panic(err)
-		}
-	}
-	priv, err := YK.PrivateKey(piv.SlotSignature, f.pubKeyInfo.PublicKey, auth)
+
+	priv, err := f.yubikeyReader.PrivateKey(piv.SlotSignature, f.cert.PublicKey, auth)
 	if err != nil {
 		panic(err)
 	}
 	logging.Println(fmt.Sprintf("Signing operation... please press Yubikey to confirm presence for key %s MD5: %x",
-		PIVKeyString(f.pubKeyInfo.Algorithm),
-		md5sum(f.pubKeyInfo.PublicKey)))
+		f.cert.PublicKeyAlgorithm.String(),
+		md5sum(f.cert.PublicKey)))
 	return priv.(crypto.Signer)
 }
 
 func (f *Yubikey) Description() string { return f.Certificate().Subject.SerialNumber }
 
 // save YubiKey data to file
-// the piv.pubKeyInfo.PublicKey is set to `nil` as its default marshal/unmarshal to json does not work
-// the public key is instead saved in `PublicKey`
-// Saves
-//
-//	{
-//	   "Info": piv.pubKeyInfo,
-//	   "Slot": "signature",
-//	   "PublicKey": publicKey
-//	}
 func (f *Yubikey) PrivateKeyBytes() []byte {
 	yubiData := YubikeyData{
-		Info:      *f.pubKeyInfo,
-		Slot:      "signature",
-		PublicKey: base64.StdEncoding.EncodeToString(x509.MarshalPKCS1PublicKey(f.pubKeyInfo.PublicKey.(*rsa.PublicKey))),
+		Slot:        piv.SlotSignature.String(),
+		Algorithm:   f.algorithm,
+		PinPolicy:   f.pinPolicy,
+		TouchPolicy: f.touchPolicy,
+		PublicKey:   base64.StdEncoding.EncodeToString(x509.MarshalPKCS1PublicKey(f.cert.PublicKey.(*rsa.PublicKey))),
 	}
-	yubiData.Info.PublicKey = nil
 
 	b, err := json.Marshal(yubiData)
 	if err != nil {

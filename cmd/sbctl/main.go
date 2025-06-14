@@ -96,8 +96,8 @@ func main() {
 	// We need to set this after we have parsed stuff
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		state := &config.State{
-			Fs:             fs,
-			YubikeySigKeys: &config.YubiConfig{},
+			Fs:      fs,
+			Yubikey: &config.YubikeyReader{},
 			TPM: func() transport.TPMCloser {
 				return rwc
 			},

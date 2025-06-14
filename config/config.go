@@ -1,18 +1,23 @@
 package config
 
 import (
+	"crypto"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/foxboron/sbctl/fs"
+	"github.com/foxboron/sbctl/logging"
+	"github.com/go-piv/piv-go/v2/piv"
 	"github.com/landlock-lsm/go-landlock/landlock"
 
 	"github.com/foxboron/go-uefi/efi/util"
 	"github.com/foxboron/go-uefi/efivarfs"
-	"github.com/go-piv/piv-go/v2/piv"
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/uuid"
 	"github.com/spf13/afero"
@@ -34,11 +39,6 @@ type KeyConfig struct {
 	Pubkey      string `json:"pubkey"`
 	Type        string `json:"type"`
 	Description string `json:"description,omitempty"`
-}
-
-type YubiConfig struct {
-	PubKeyInfo *piv.KeyInfo
-	Overwrite  bool
 }
 
 type Keys struct {
@@ -139,13 +139,106 @@ func NewConfig(b []byte) (*Config, error) {
 	return conf, nil
 }
 
+// A type to wrap piv.Yubikey to manage the yubikey handle
+type YubikeyReader struct {
+	key       *piv.YubiKey
+	Overwrite bool
+}
+
+func (y *YubikeyReader) GetPIVKeyCert() (*x509.Certificate, error) {
+	if y.key == nil {
+		if err := y.connectToYubikey(); err != nil {
+			return nil, err
+		}
+	}
+	return y.key.Attest(piv.SlotSignature)
+}
+
+func (y *YubikeyReader) GenerateKey(key []byte, slot piv.Slot, opts piv.Key) (crypto.PublicKey, error) {
+	if y.key == nil {
+		if err := y.connectToYubikey(); err != nil {
+			return nil, err
+		}
+	}
+	return y.key.GenerateKey(key, slot, opts)
+}
+
+func (y *YubikeyReader) PrivateKey(slot piv.Slot, public crypto.PublicKey, auth piv.KeyAuth) (crypto.PrivateKey, error) {
+	if y.key == nil {
+		if err := y.connectToYubikey(); err != nil {
+			return nil, err
+		}
+	}
+	return y.key.PrivateKey(slot, public, auth)
+}
+
+func (y *YubikeyReader) connectToYubikey() error {
+	if y.key != nil {
+		return nil
+	}
+	cards, err := piv.Cards()
+	if err != nil {
+		return err
+	}
+	if len(cards) == 0 {
+		logging.Warn("No yubikey connected... Please connect yubikey! Waiting 90 seconds...")
+		c := make(chan []string, 1)
+		go func() {
+			for {
+				time.Sleep(500 * time.Millisecond)
+				if newCards, err := piv.Cards(); err == nil {
+					if len(newCards) > 0 {
+						logging.Println("Found a connected yubikey")
+						c <- newCards
+						return
+					}
+				}
+			}
+		}()
+		select {
+		case <-time.After(90 * time.Second):
+			return fmt.Errorf("timeout waiting for yubikey")
+		case cards = <-c:
+		}
+	}
+
+	if len(cards) > 1 {
+		err := fmt.Errorf("unable to connect to yubikey: multiple yubikeys connected")
+		logging.Error(err)
+		return err
+	}
+
+	// Find a YubiKey and open the reader.
+	var yk *piv.YubiKey
+	for _, card := range cards {
+		if strings.Contains(strings.ToLower(card), "yubikey") {
+			if yk, err = piv.Open(card); err != nil {
+				return err
+			}
+			break
+		}
+	}
+	if yk == nil {
+		return fmt.Errorf("yubikey key not found")
+	}
+	y.key = yk
+	return nil
+}
+
+func (y *YubikeyReader) Close() error {
+	if y.key != nil {
+		return y.key.Close()
+	}
+	return nil
+}
+
 // Key creation is going to require differen callbacks to we abstract them away
 type State struct {
-	Fs             afero.Fs
-	TPM            func() transport.TPMCloser
-	Config         *Config
-	Efivarfs       *efivarfs.Efivarfs
-	YubikeySigKeys *YubiConfig
+	Fs       afero.Fs
+	TPM      func() transport.TPMCloser
+	Config   *Config
+	Efivarfs *efivarfs.Efivarfs
+	Yubikey  *YubikeyReader
 }
 
 func (s *State) IsInstalled() bool {
